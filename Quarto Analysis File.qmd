@@ -1,0 +1,1968 @@
+---
+title: "Aspirin Eligibility for Primary Prevention Among US Adults Aged 40-50 according to PREVENT vs PCE"
+format: 
+  html:
+    toc: true
+    toc-expand: true
+    toc-location: body
+date: 12-15-2024
+theme: lightly
+author:
+  - name: "Ahmed Sayed (asu.ahmed.sayed@gmail.com)"
+    affiliations: "Houston Methodist DeBakey Heart & Vascular Center"
+embed-resources: true
+toc-title: Contents
+page-layout: full
+code-fold: true
+editor: visual
+editor_options: 
+  chunk_output_type: console
+---
+
+# Setup
+
+## Libraries
+
+```{r}
+#Load libs
+packs <- c("data.table", "dplyr", "foreach",
+           "stringr", "haven", "PooledCohort",
+           "ggplot2", "fastsurvey", "scales",
+           "flextable", "ggsci", "ggthemes",
+           "scales"
+           )
+lapply(packs, require, character.only = TRUE)
+options(survey.lonely.psu = "adjust")
+```
+
+## Self-made functions
+
+### Analytic
+
+```{r}
+#Quantiles
+qs <- function(variable) quantile(variable, seq(0, 1, 0.05), na.rm = T)
+
+
+
+#Function to rename columns. Please note that this is a more general function not intended purely for this analysis and therefore contains other variables irrelevant to it.
+nhanes_rename <- function(x) { x %>% rename(any_of(c(
+  #Survey cycle and demographics
+  "survey_cycle" = "SDDSRVYR",
+  "age" = "RIDAGEYR",
+  "sex" = "RIAGENDR",
+  "race" = "RIDRETH3",
+  #Medical conditions
+  "htn" = "BPQ020",
+  "dyslipid" = "BPQ080",
+  "dm" = "DIQ010",
+  "pre_dm" = "DIQ160",
+  "chd" = "MCQ160C",
+  "angina" = "MCQ160D",
+  "mi" = "MCQ160E",
+  "stroke" = "MCQ160F",
+  "smoke_100" = "SMQ020",
+  "smoke_now" = "SMQ040",
+  "cancer" = "MCQ220",
+  "dialysis" = "KIQ025",
+  "failing_kidney" = "KIQ022",
+  "hf" = "MCQ160B",
+  #Medical recommendations
+  "salt_adv_take" = "MCQ371C",
+  "chol_meds_adv" = "BPQ090D",
+  "chol_meds_take" = "BPQ100D",
+  "htn_meds_adv" = "BPQ040A",
+  "htn_meds_take" = "BPQ050A",
+  "aspirin_adv" = "RXQ510",
+  "aspirin_adv_take" = "RXQ515",
+  "aspirin_indep" = "RXQ520",
+  #Exam data
+  "sbp_1" = "BPXOSY1",
+  "sbp_2" = "BPXOSY2",
+  "sbp_3" = "BPXOSY3",
+  "sbp_1" = "BPXSY1",
+  "sbp_2" = "BPXSY2",
+  "sbp_3" = "BPXSY3",
+  "dbp_1" = "BPXODI1",
+  "dbp_2" = "BPXODI2",
+  "dbp_3" = "BPXODI3",
+  "dbp_1" = "BPXDI1",
+  "dbp_2" = "BPXDI2",
+  "dbp_3" = "BPXDI3",
+  "bmi" = "BMXBMI",
+  #Lab values
+  "fasting_glucose" = "LBXGLU",
+  "hba1c" = "LBXGH",
+  "apo_b" = "LBXAPB",
+  "ldl" = "LBDLDL",
+  "ldl_mh" = "LBDLDLM",
+  "ldl_nih" = "LBDLDLN",
+  "tg" = "LBXTR",
+  "hdl" = "LBDHDD",
+  "tc" = "LBXTC",
+  "creatinine" = "LBXSCR",
+  "urine_creatinine" = "URXUCR",
+  "urine_albumin" = "URXUMS",
+  "platelets" = "LBXPLTSI"
+)))
+}
+
+
+#Import an nhanes file given an NHANES folder and file
+import_nhanes <- function(nhanes_pair) {
+          
+          #State directory of files
+          files <- dir(paste0(nhanes_dir, nhanes_pair[1])) %>%
+            #P_I and #_I select 2015-2020 data
+            str_subset("P_|_I")
+          
+          
+          #Import files in a given subfolder (lapply is not needed here, but it is made to be more general in case you need more than 1 file a year)
+          lapply(files,
+                 function(file) {
+                    
+                    #Read the file
+                    data <- read_xpt(file = paste0(nhanes_dir, 
+                                                   nhanes_pair[1], "/", 
+                                                   file)
+                                     )
+                    #Rename columns
+                    data <- nhanes_rename(data)
+                    
+                    #If meds, start command to join medications together
+                    if(nhanes_pair[2] == "meds") {
+                      
+                      #Join medications together
+                      if("RXDDRUG" %in% colnames(data)) {
+                        data <- data %>%
+                          group_by(SEQN) %>%
+                          summarise(drug_names = paste(RXDDRUG, collapse = "; "),
+                                    drug_reasons = paste0(RXDRSC1, RXDRSC2,
+                                                          RXDRSC3, collapse = "; ")
+                                    )
+                        
+                      } else if("RXD240B" %in% colnames(data)) {
+                        
+                        data <- data %>%
+                          group_by(SEQN) %>%
+                          summarise(drug_names = paste(RXD240B, collapse = "; "),
+                                    )
+                      }
+                    }
+                    
+                    #Return the object
+                    data
+                   
+                 }
+                    
+          ) %>%
+            #Use rbindlist in case you are importing several years at once
+            rbindlist(fill = T) -> data
+          
+          
+}
+
+#Convert variables coded as 1279 in NHANES to Yes/No
+convert_1279 <- function(variable, yes_ind = "Yes", no_ind = "No") {
+  fcase(variable == 1, yes_ind,
+        variable == 2, no_ind)
+}
+
+#Convert variables coded as 123479 in NHANES to Yes/No (this is for aspirin use)
+convert_123479 <- function(variable, yes_ind = "Yes", no_ind = "No") {
+  fcase(variable %in% c(1, 3), yes_ind,
+        variable %in% c(2, 4), no_ind)
+}
+
+
+#Convert race for PCE (White and Black only; everyone is assigned to White if they're not Black)
+convert_race_pce <-  function(variable) {
+  fcase(variable %in% c(1, 2, 3, 6, 7), "white",
+        variable == 4, "black"
+        )
+}
+
+#Convert race
+convert_race_complete <-  function(variable) {
+  fcase(variable %in% c(1, 2), "Hispanic",
+        variable == 3, "Non-Hispanic White",
+        variable == 4, "Non-Hispanic Black",
+        variable == 6, "Non-Hispanic Asian",
+        variable == 7, "Other (including multiracial)"
+        )
+}
+
+#Function to indicate if drug was taken
+find_drug <- function(drugs_column, drug_string, yes_ind = "Yes", no_ind = "No") {
+  fifelse(str_detect(drugs_column, drug_string), yes_ind, no_ind)
+}
+
+#Function to indicate if indication is present
+find_ind <- function(inds_column, ind_string, yes_ind = "Yes", no_ind = "No") {
+  fifelse(str_detect(inds_column, ind_string), yes_ind, no_ind)
+}
+
+
+#Create a function to get survey means and CIs
+svymean_df <- function(design, variables) {
+  
+  #Get chosen variables in the form of "or"
+  variables[2] %>%
+    #Convert to character
+    paste0 %>%
+    #Replace + with or
+    str_replace_all("\\+", "\\|") %>%
+    #Squish together
+    str_replace_all(" \\| ", "\\|") -> chosen_vars
+  
+  #Get the part of svymean's name that corresponds to the variable name
+  svymean(design = design, variables, na.rm = T) %>%
+    names %>%
+    str_extract(chosen_vars) -> chosen_vars
+  
+  
+  #Produce data.table containing the information on totals
+  data.table(
+    #Variable
+    var = chosen_vars,
+    #Variable level
+    #Total
+    pe = svymean(design = design, variables, na.rm = T) %>%
+      data.frame %>%
+      {.$mean},
+    #LCI
+    lci = svymean(design = design, variables, na.rm = T) %>% confint %>% data.frame %>% {.$X2.5..},
+    #UCI
+    uci = svymean(design = design, variables, na.rm = T) %>% confint %>% data.frame %>% {.$X97.5..}
+  ) -> mean_df
+  
+  #Return
+  mean_df
+  
+}
+
+#Create a function to neatly get survey totals/proportions and confidence intervals
+svytotal_df <- function(design, variables) {
+  
+  #Get chosen variables in the form of "or"
+  variables[2] %>%
+    #Convert to character
+    paste0 %>%
+    #Replace + with or
+    str_replace_all("\\+", "\\|") %>%
+    #Squish together
+    str_replace_all(" \\| ", "\\|") -> chosen_vars
+  
+  #Get the part of svytotal's name that corresponds to the variable name
+  svytotal(design = design, variables, na.rm = T) %>%
+    names %>%
+    str_extract(chosen_vars) -> chosen_vars
+  
+  #Get the part of svytotal's name that corresponds to the variable value
+  svytotal(design = design, variables, na.rm = T) %>%
+    names %>%
+    str_remove_all(chosen_vars) -> chosen_vars_levels
+  
+  #Produce data.table containing the information on totals
+  data.table(
+    #Variable
+    var = chosen_vars,
+    #Variable level
+    value = chosen_vars_levels,
+    #Total
+    pe = svytotal(design = design, variables, na.rm = T) %>%
+      data.frame %>%
+      {.$total},
+    #LCI
+    lci = svytotal(design = design, variables, na.rm = T) %>% confint %>% data.frame %>% {.$X2.5..},
+    #UCI
+    uci = svytotal(design = design, variables, na.rm = T) %>% confint %>% data.frame %>% {.$X97.5..}
+  ) -> total_df
+  
+  lapply(chosen_vars_levels,
+         function(level) {
+           form <- bquote(~ .(variables[[2]]) == .(level))
+           #Get proportion
+           svyciprop(design = design, 
+          formula = form, na.rm = T
+          ) %>% {data.table(
+               prop_pe = .[1],
+               prop_lci = attr(., "ci") %>% .["2.5%"],
+               prop_uci = attr(., "ci") %>% .["97.5%"]
+             )}
+         }
+  ) %>%
+    rbindlist -> props_df
+  
+  #Bind
+  df <- cbind(total_df, props_df)
+  
+  #Return
+  df
+  
+}
+
+
+```
+
+### Aesthetic
+
+```{r}
+
+#Create PE (CI) column
+pe_ci <- function(pe = pe, lci = lci, uci = uci, rounding = 2) {
+  paste0(
+    pe  %>% round(rounding) %>% format(nsmall = rounding), " (", 
+    lci %>% round(rounding) %>% format(nsmall = rounding), " to ",
+    uci  %>% round(rounding) %>% format(nsmall = rounding),
+    ")"
+  )
+}
+
+
+#Loop over numeric variables, sex, and binary (Yes/no) variables and summarize
+sum_var <- function(dataset, variable) {
+  #Numeric vars 
+  if(variable %in% numeric_variables) {
+    dataset[, 
+      paste0(median(get(variable), na.rm = T) %>% round(1) %>% format(nsmall = 1),
+             " (", 
+             iqr(get(variable)), ")"
+      )
+    ]
+  } 
+  
+  #Sex
+  else if(variable %>% str_detect("sex|gender")) {
+    paste0(dataset[get(variable) %in% c("female", "Female", "Women", "women"), .N] %>% scales::comma(),
+           " (", (100*dataset[get(variable) %in% c("female", "Female", "Women", "women"), .N]/dataset[, .N]) %>% r1, "%)")
+  }
+  
+  #Binary vars
+  else if(variable %in% binary_variables) {
+    paste0(dataset[get(variable) %in% c("Yes", "yes"), .N] %>% scales::comma(),
+           " (", (100*dataset[get(variable) %in% c("Yes", "yes"), .N]/dataset[, .N]) %>% r1, "%)")
+  }
+}
+
+
+#Get IQRs
+iqr <- function(x, rounding = 1) {
+  paste0(
+    quantile(x, 0.25, na.rm = T) %>% round(rounding) %>% format(nsmall = rounding),
+    " to ",
+    quantile(x, 0.75, na.rm = T) %>% round(rounding) %>% format(nsmall = rounding)
+  )
+  
+}
+
+#Round to 1 decimal and include zero if needed
+r1 <- function(x) {
+  x %>% round(1) %>% format(nsmall = 1)
+}
+
+#Round to 2 decimals and include zero if needed
+r2 <- function(x) {
+  x %>% round(2) %>% format(nsmall = 2)
+}
+
+#Perform some aesthetic modifications for flextables
+flextable_aes <- function(table, table_title) {
+  
+  #Table font
+  table <- flextable::font(table, fontname = "Times New Roman", part = "all")
+  
+  #Align everything centrally
+  table <- flextable::align(table, align = "center", part = "all")
+  
+  #Table heading
+  table <- flextable::set_caption(table, caption = table_title)
+  
+  #Align footer to the left
+  table <- flextable::align(table, align = "left", part = "footer")
+  
+  
+  #Set Table width
+  table <- flextable::width(table, width = 1.5, unit = "in")
+  
+  #Bold
+  table <- flextable::bold(table, part = "header")
+  
+  #Borders
+  table <- table %>% border_inner %>% border_outer
+  
+  #Print
+  table
+}
+
+```
+
+## Import
+
+```{r}
+
+#The lefthand side is the name of the folder in which the respective NHANES data files should be deposited. The lefthand side is the name that will be used for the data.frame in R
+folders_dfs <- list(
+  c("Demographics", "demo"),
+  c("LDL_TG_Measure", "ldl_tg_measure"),
+  c("TC_measure", "tc_measure"),
+  c("HDL_Measure", "hdl_measure"),
+  c("Glycohemoglobin", "hba1c"),
+  c("Fasting_Glucose", "fasting_glucose"),
+  c("BMI", "bmi"),
+  c("BP_Measure", "bp_measure"),
+  c("BP_Chol", "bp_chol"),
+  c("Diabetes", "dm_df"),
+  c("Smoke", "smoke_df"),
+  c("Urine albumin and creatinine", "urine_alb_cr"),
+  c("Medical Conditions", "med_conds"),
+  c("Biochem Profile", "biochem"),
+  c("Aspirin", "aspirin"),
+  c("Meds", "meds"),
+  c("CBC", "cbc"),
+  c("Kidney", "kidney"),
+  c("Insurance", "insurance")
+)
+
+#Get NHANES directory
+nhanes_dir <- "INSERT YOUR NHANES DIRECTORY HERE"
+
+#Lapply to import NHANES data for a given set of variables
+lapply(folders_dfs, function(folder) import_nhanes(folder)) -> data
+
+#Use Reduce to successively merge elements of the data list
+Reduce(function(x, y) merge(x, y, all = T, by = "SEQN"), data) -> data
+
+##TABLE 1 FUNCTION
+table1_create <- function(dataset, variables, table1_title, 
+                          strata_var = NULL, 
+                          p_values = FALSE,
+                          p_values_col_ind = 5,
+                          table_width = 3,
+                          numeric_variables, binary_variables
+) {
+  
+  #Store variable names
+  var_names <- names(variables)
+  
+  
+  #Get overall CCs using the sum_var function
+  lapply(var_names, function(variable) sum_var(dataset, variable)) -> overall_values
+  
+  #Create strata CCs using the same but with an additional layer of looping for strata levels
+  if(!is.null(strata_var)) {
+    
+    #Strata levels  
+    strata_levels <- dataset[, get(strata_var) %>% factor %>% levels]
+    
+    #Apply over levels of strata of interest
+    lapply(1:length(strata_levels),
+           function(i)
+           {
+             stratum <- strata_levels[[i]]
+             #CCs of level 1
+             lapply(var_names, function(variable) sum_var(dataset = dataset[get(strata_var) == stratum], variable)) %>%
+               unlist
+           }
+    ) -> strata_values
+    
+    
+  }
+  
+  
+  #Create data.table containing the relevant variables
+  data.table(
+    variable_names = variables %>% unlist,
+    variable_values = overall_values %>% unlist
+  ) -> table1_df
+  
+  #Create new columns with the corresponding values for each strata
+  if(!is.null(strata_var)) {
+    for(i in 1:length(strata_values)) {
+      table1_df[, paste0("level_", i) := strata_values[[i]]]
+      setnames(table1_df, old = paste0("level_", i), new = strata_levels[i])
+    }
+  }
+  
+  #Get p-values if necessary
+  if(p_values) {
+    #Loop over variables to get test statistics
+    lapply(var_names, 
+           function(var_name) test_var(dataset, variable = var_name, strata_var)) %>% unlist -> pvals
+    table1_df[, p_values := pvals]
+  }
+  
+  #Rename and create a flextable
+  table1_df %>%
+    rename(any_of(c(
+      "Variables" = "variable_names",
+      "Overall" = "variable_values",
+      "P-values*" = "p_values"
+    ))) %>%
+    flextable %>% 
+    flextable_aes(table1_title) %>%
+    bold(j = 1) %>%
+    width(width = table_width) -> table_flex
+  
+  #Add P-value if relevant
+  if(p_values) {
+    table_flex <- footnote(table_flex, 
+             ref_symbols = footnote_symbol(1), 
+             j = p_values_col_ind,
+             value = as_paragraph("P-values were obtained from Wilcoxon test for continuous variables or from a Chi-square test for categorical variables."))
+  }
+  
+  #Produce table
+  table_flex
+}
+```
+
+## Clean & Prep
+
+```{r}
+
+#Convert variables coded as 1, 2, 7, or 9
+columns_1279 <- c("pre_dm", "dm", "htn", "smoke_100",
+                  "chd", "mi", "stroke", "angina", 
+                  "cancer", "htn_meds_adv", "htn_meds_take",
+                  "aspirin_adv", "aspirin_indep", 
+                  "failing_kidney", "dialysis", "hf"
+                  )
+data[, (columns_1279) := lapply(.SD, convert_1279, "yes", "no"), 
+     .SDcols = columns_1279]
+
+#Convert taking aspirin or hypertension to no if appropriate 
+data[, htn_meds_take := fifelse(htn == "no" | htn_meds_adv == "no", "no", htn_meds_take)]
+
+#Denote column contianing "Taking aspirin based on Dr's advice"
+data[, aspirin_adv_take := fcase(
+  aspirin_adv_take == 1, "yes",
+  aspirin_adv_take %in% c(2, 4), "no"
+)]
+
+#Denote column containing "Taking aspirin independently"
+data[, aspirin_indep := fcase(
+  aspirin_indep == "yes", "yes",
+  aspirin_adv_take == "no" | aspirin_indep == "no", "no"
+)]
+
+#Denote column for any aspirin use
+data[, aspirin := fcase(
+  aspirin_adv_take == "yes" | aspirin_indep == "yes", "yes",
+  (aspirin_indep == "no") | (aspirin_adv_take == "no" & aspirin_adv == "yes"), "no"
+)]
+
+##Manual checks (to ensure that aspirin has been coded correctly)
+#Yes
+1707+211+128+991 == data[aspirin == "yes", .N]
+#No
+370+51+2151+683+68+3658 == data[aspirin == "no", .N]
+
+#Convert sex
+data[, sex := fcase(
+    sex == 1, "male",
+    sex == 2, "female"
+)]
+
+
+#Build a string for statins
+statin_string <- c("(?i)LOVASTATIN|PRAVASTATIN|FLUVASTATIN|ROSUVASTATIN|PITAVASTATIN|ATORVASTATIN|SIMVASTATIN|CERIVASTATIN")
+
+#Build a string for antiplatelets
+platelet_string <- c("(?i)CLOPIDOGREL|PRASUGREL|TICAGRELOR|TICLOPIDINE|DIPYRIDAMOLE|CILOSTAZOL")
+
+#Build a string for anticoag
+anticoag_string <- c("(?i)APIXABAN|RIVAROXABAN|EDOXABAN|DABIGRAN|ENOXAPARIN|FONDAPARINAUX|HEPARIN|WARFARIN")
+
+#Build a string for steroids
+steroid_string <- c("(?i)CORTISONE|BETAMETHASONE|DEXAMETHASONE|FLUDROCORTISONE|HYDROCORTISONE|METHYLPREDNISOLONE|PREDNISOLONE|PREDNISONE")
+
+#Build a string for NSAIDs
+nsaid_string <- c("(?i)DICLOFENAC|IBUPROFEN|INDOMETHACIN|KETOPROFEN|FENOPROFEN|NAPROXEN|MELOXICAM|KETOROLAC|DIFLUINSAL|MEFENAMIC ACID|TIAPROFENIC ACID")
+
+ssri_string <- c("(?i)CITALOPRAM|ESCITALOPRAM|FLUOXOTINE|FLUVOXAMINE|PAROXETINE|SERTRALINE|VENLAFAXINE|DULOXETINE")
+
+#Indicate drug use
+data[, statin := find_drug(drug_names, statin_string, "yes", "no")]
+data[, ssri := find_drug(drug_names, ssri_string, "yes", "no")]
+data[, nsaid := find_drug(drug_names, nsaid_string, "yes", "no")]
+data[, steroid := find_drug(drug_names, steroid_string, "yes", "no")]
+data[, anticoag := find_drug(drug_names, anticoag_string, "yes", "no")]
+data[, platelet := find_drug(drug_names, platelet_string, "yes", "no")]
+
+#GI Ulcers
+gi_ulcer_string <- c("(?i)K25|K27")
+data[, gi_ulcer := find_ind(drug_reasons, gi_ulcer_string, "yes", "no")]
+data[gi_ulcer == "yes", drug_names]
+
+#Convert race
+data[, race_pce := convert_race_pce(race)]
+data[, race := convert_race_complete(race)]
+data[, black := fifelse(race == "Non-Hispanic Black", "yes", "no")]
+data[, hispanic := fifelse(race == "Hispanic", "yes", "no")]
+data[, asian := fifelse(race == "Asian", "yes", "no")]
+
+
+#Convert current smoking habits
+data[, smoke_now := fcase(
+  smoke_now == 1, "yes",
+  smoke_now == 2, "yes",
+  smoke_now == 3, "no",
+  smoke_100 == "no", "no"
+)]
+
+#Create obesity
+data[, obesity := fifelse(bmi >= 30, "yes", "no")]
+
+#Calcualte avg systolic and diastolic BP
+data[, sbp := (sbp_1 + sbp_2 + sbp_3)/3]
+data[, dbp := (dbp_1 + dbp_2 + dbp_3)/3]
+
+#Define DM
+data[, dm := fcase(
+  hba1c >= 6.5, "yes",
+  fasting_glucose >= 126, "yes",
+  dm == "yes", "yes",
+  dm == "no", "no"
+  )]
+
+#Define HTN
+data[, htn := fifelse(sbp >= 130 | dbp >= 80 | htn == "yes", "yes", "no")]
+
+#Calculate sex-specific constants for eGFR estimation
+data[, alpha := fifelse(sex == "male", -0.302, -0.241)]
+data[, k := fifelse(sex == "male", 0.9, 0.7)]
+data[, constant := fifelse(sex == "male", 1, 1.012)]
+
+#Calculate eGFR
+data[, egfr :=
+    142 *
+    (pmin(creatinine/k, 1)^alpha) *
+    (pmax(creatinine/k, 1)^-1.2) *
+    (0.9938^age) *
+    constant
+    ]
+
+
+#Create albumin/creatinine ratio
+data[, uacr := urine_albumin/(10*urine_creatinine/1000)]
+
+```
+
+## Exclusion Criteria
+
+```{r}
+#Denote high bleeding risk (hbr)
+data[, hbr := fifelse(egfr < 30 | uacr >= 300 | platelets < 100 |
+    steroid == "yes" | platelet == "yes" | anticoag == "yes" |
+       gi_ulcer == "yes" | cancer == "yes" | hf == "yes", "yes", "no")]
+
+#Inclusion criteria (to avoid repeated filter)
+inclusion <- expression(age %between% c(40, 59) & mi == "no" & stroke == "no" & angina == "no" & chd == "no")
+
+
+#N with high risk of bleeding markers
+high_bleeding_risk_n <- data[eval(inclusion) &
+                               hbr == "yes", .N]
+#N Lacking 10-year risk estimates
+lacking_risk_n <- data[eval(inclusion) &
+                               hbr == "yes" & (is.na(pce_10yr) | is.na(prevent_10yr)), .N]
+```
+
+## Calculate risk
+
+```{r}
+
+#Create capped versions of variables
+data[, tc_cap := fcase(
+  tc < 130, 130,
+  tc > 320, 320,
+  rep(TRUE, .N), tc
+)]
+data[, sbp_cap := fcase(
+  sbp < 90, 90,
+  sbp > 200, 200,
+  rep(TRUE, .N), sbp
+)]
+
+data[, hdl_cap_prevent := fcase(
+  hdl < 20, 20,
+  hdl > 100, 100,
+  rep(TRUE, .N), hdl
+)]
+
+data[, bmi_cap_prevent := fcase(
+  bmi < 18.5, 18.5,
+  bmi > 40, 40,
+  rep(TRUE, .N), bmi
+)]
+
+data[, egfr_cap_prevent := fcase(
+  egfr < 15, 15,
+  egfr > 140, 140,
+  rep(TRUE, .N), egfr
+)]
+
+data[, eligible := fifelse(
+  age >= 40 & age <= 75, 1, 0
+)]
+PooledCohort:::._prevent()
+#Calculate 10-year risk using PREVENT
+data[eligible == 1, prevent_10yr := predict_10yr_ascvd_risk(
+  age_years = age,
+  sex = sex,
+  bp_sys_mmhg = sbp_cap,
+  bmi = bmi_cap_prevent,
+  diabetes = dm,
+  bp_meds = htn_meds_take,
+  chol_total_mgdl = tc_cap,
+  chol_hdl_mgdl = hdl_cap_prevent,
+  statin_meds = statin,
+  smoke_current = smoke_now,
+  egfr = egfr_cap_prevent,
+  equation = "Khan_2023"
+)]
+
+
+data[, statin_num := fifelse(statin == "yes", 1, 0)]
+data[, dm_num := fifelse(dm == "yes", 1, 0)]
+data[, smoke_num := fifelse(smoke_now == "yes", 1, 0)]
+data[, htn_meds_num := fifelse(htn_meds_take == "yes", 1, 0)]
+
+
+#Calculate 10-year risk using more expansive PREVENT
+# data[eligible == 1, prevent_10yr_more := predict_10yr_ascvd_risk(
+#   age_years = age,
+#   sex = sex,
+#   bp_sys_mmhg = sbp_cap,
+#   bmi = bmi_cap_prevent,
+#   diabetes = dm,
+#   hba1c = hba1c,
+#   acr = uacr,
+#   bp_meds = htn_meds_take,
+#   chol_total_mgdl = tc_cap,
+#   chol_hdl_mgdl = hdl_cap_prevent,
+#   statin_meds = statin,
+#   smoke_current = smoke_now,
+#   egfr = egfr_cap_prevent,
+#   sdi = NULL,
+#   equation = "Khan_2023",
+#   prevent_type = "base"
+# )]
+
+#Calculate 10-year risk using PCE
+data[eligible == 1, pce_10yr := predict_10yr_ascvd_risk(
+  age_years = age,
+  race = race_pce,
+  sex = sex,
+  bp_sys_mmhg = sbp_cap,
+  diabetes = dm,
+  bp_meds = htn_meds_take,
+  chol_total_mgdl = tc_cap,
+  chol_hdl_mgdl = hdl_cap_prevent,
+  smoke_current = smoke_now,
+  equation = "Goff_2013"
+)]
+
+data[, sdi := NA]
+#Calculate 10-year risk using the full PREVENT equation
+data[eligible == 1, prevent_10yr_full := predict_10yr_ascvd_risk(
+  age_years = age,
+  sex = sex,
+  bp_sys_mmhg = sbp_cap,
+  bmi = bmi_cap_prevent,
+  diabetes = dm,
+  bp_meds = htn_meds_take,
+  chol_total_mgdl = tc_cap,
+  chol_hdl_mgdl = hdl_cap_prevent,
+  statin_meds = statin,
+  smoke_current = smoke_now,
+  egfr = egfr_cap_prevent,
+  hba1c = hba1c,
+  acr = uacr,
+  sdi = sdi,
+  equation = "Khan_2023",
+  prevent_type = "full"
+)]
+
+#Designate >10%
+data[, pce_0.1 := fifelse(pce_10yr >= 0.1, "yes", "no")]
+data[, prevent_0.1 := fifelse(prevent_10yr >= 0.1, "yes", "no")]
+data[, prevent_full_0.1 := fifelse(prevent_10yr_full >= 0.1, "yes", "no")]
+
+```
+
+## Calculate ASCVD risk reductions
+
+```{r}
+#Calculate 10yr odds of an event
+data[, pce_10yr_odds := pce_10yr/(1 - pce_10yr)]
+data[, prevent_10yr_odds := prevent_10yr/(1 - prevent_10yr)]
+
+#Multiply by OR found in the JAMA USPSTF SR (0.9) and convert back to risk
+data[, pce_10yr_post_aspirin := (pce_10yr_odds * 0.9)/((pce_10yr_odds * 0.9) + 1)]
+data[, prevent_10yr_post_aspirin := (prevent_10yr_odds * 0.9)/((prevent_10yr_odds * 0.9) + 1)]
+
+#Calculate  ARR
+data[, pce_10yr_aspirin_diff := pce_10yr - pce_10yr_post_aspirin]
+data[, prevent_10yr_aspirin_diff := prevent_10yr - prevent_10yr_post_aspirin]
+
+```
+
+## Calculate bleeding increase
+
+### Gastrointestinal
+
+```{r}
+#Obtained from eTable 1 in 10.1001/jama.2022.3385
+data[, gi_annual_bleed_risk := 
+       fcase(
+         age %between% c(40, 49) & sex == "female", (0.10)/100,
+         age %between% c(50, 59) & sex == "female", (0.13)/100,
+         age %between% c(40, 49) & sex == "male", (0.14)/100,
+         age %between% c(50, 59) & sex == "male", (0.16)/100
+       )
+       ]
+
+#Calculate 10-year risk
+data[, gi_bleed_risk_10yr := 1 - ((1-gi_annual_bleed_risk)^10)]
+
+#Convert to odds
+data[, gi_bleed_odds_10yr := gi_bleed_risk_10yr/(1 - gi_bleed_risk_10yr)]
+
+#Multiply by OR for major bleeding found in JAMA (1.58) 
+data[, gi_bleed_odds_10yr_post_aspirin := gi_bleed_odds_10yr * 1.58]
+data[, gi_bleed_risk_10yr_post_aspirin := gi_bleed_odds_10yr_post_aspirin/(1 + gi_bleed_odds_10yr_post_aspirin)]
+
+#ARI for aspirin
+data[, gi_bleed_10yr_aspirin_diff := gi_bleed_risk_10yr_post_aspirin - gi_bleed_risk_10yr]
+```
+
+### Intracranial
+
+```{r}
+  #Obtained from Selak et al., 2018
+data[, ic_annual_bleed_risk := 
+       fcase(
+         age %between% c(40, 49) & sex == "female", (0.019)/100,
+         age %between% c(50, 59) & sex == "female", (0.029)/100,
+         age %between% c(40, 49) & sex == "male", (0.011)/100,
+         age %between% c(50, 59) & sex == "male", (0.033)/100
+       )
+       ]
+
+#Calculate 10-year risk
+data[, ic_bleed_risk_10yr := 1 - ((1-ic_annual_bleed_risk)^10)]
+
+#Convert to odds
+data[, ic_bleed_odds_10yr := ic_bleed_risk_10yr/(1 - ic_bleed_risk_10yr)]
+
+#Multiply by OR for major bleeding found in JAMA (1.58) 
+data[, ic_bleed_odds_10yr_post_aspirin := ic_bleed_odds_10yr * 1.31]
+data[, ic_bleed_risk_10yr_post_aspirin := ic_bleed_odds_10yr_post_aspirin/(1 + ic_bleed_odds_10yr_post_aspirin)]
+
+#ARI for aspirin
+data[, ic_bleed_10yr_aspirin_diff := ic_bleed_risk_10yr_post_aspirin - ic_bleed_risk_10yr]
+```
+
+## Calculate net benefit
+
+```{r}
+
+#Sum increased bleeding risk
+data[, bleed_10yr_aspirin_diff := ic_bleed_10yr_aspirin_diff + gi_bleed_10yr_aspirin_diff]
+
+#Calculate net benefit
+data[, pce_nb := (pce_10yr_aspirin_diff - bleed_10yr_aspirin_diff)]
+data[, prevent_nb := (prevent_10yr_aspirin_diff - bleed_10yr_aspirin_diff)]
+
+```
+
+## Convert to a survey object
+
+```{r}
+
+#Adjust survey weights to reflect proportion of data from each cycle
+data[survey_cycle == 9, weight := WTMEC2YR * 2/5.2] 
+data[survey_cycle == 66, weight := WTMECPRP * 3.2/5.2] 
+data[is.na(weight), weight := 0]
+
+#Calculate ratio of risks
+data[, ratio := pce_10yr/prevent_10yr]
+
+#Make survey object out of x
+sdata <- svydesign(data = data,
+                ids = data$SDMVPSU,
+                strata = data$SDMVSTRA,
+                weights = data$weight,
+                nest = TRUE)
+
+#Subset to primary prevention aspirin-eligible patients
+subset(sdata, 
+       subset = 
+         #Age restrictions
+         age >= 40 & age <= 59 &
+         #CVD restrictions
+         mi == "no" & chd == "no" & stroke == "no" & angina == "no" &
+         #High bleeding risk restriction
+         hbr == "no" &
+         #Exclude incalculable 10-year risks
+         !is.na(prevent_10yr) & !is.na(pce_10yr)
+         ) -> sdata
+
+
+```
+
+# Analyze
+
+## Create Table 1
+
+```{r}
+
+#Table 1 variables
+variables = list(
+  age = "Age (years)",
+  sex = "Sex (% of women)",
+  black = "African American (%)",
+  htn = "Hypertension (%)",
+  dm = "Diabetes mellitus (%)",
+  smoke_now = "Current smokers (%)",
+  statin = "Statin use (%)",
+  #Exam
+  sbp = "Systolic blood pressure (mmHg)",
+  dbp = "Diastolic blood pressure (mmHg)",
+  bmi = "Body mass index (kg/m2)",
+  #Labs
+  tc = "Cholesterol (mg/dL)",
+  tg = "Triglycerides (mg/dL)",
+  ldl = "Low-density lipoprotein cholesterol (mg/dL)",
+  hdl = "High-density lipoprotein cholesterol (mg/dL)"
+)
+
+binary_variables <- c("black", "htn", "dm", "smoke_now", "statin")
+numeric_variables <- c("age", "sbp", "dbp",
+                       "bmi", "tc", "tg", "ldl", "hdl"
+                       )
+
+table1_create(dataset = data[age >= 40 & age <= 59],
+              variables = variables,
+              table1_title = paste0("Table 1. Baseline characteristics of included participants (N = ", sdata$variables[, .N], ")"),
+              strata_var = "prevent_0.1",
+              numeric_variables = numeric_variables,
+              binary_variables = binary_variables
+              ) %>%
+  add_footer_lines("ASCVD: Atherosclerotic cardiovascular disease") -> prevent_t1
+
+table1_create(dataset = data[age >= 40 & age <= 59],
+              variables = variables,
+              table1_title = "Table 1. Baseline characteristics of adults aged 40 to 50 according to whether estimated ASCVD risk by the PREVENT equation was ≥10%, NHANES 2017-2020",
+              strata_var = "pce_0.1",
+              numeric_variables = numeric_variables,
+              binary_variables = binary_variables
+              ) %>%
+  add_footer_lines("ASCVD: Atherosclerotic cardiovascular disease; PCE: Pooled Cohort Equation") -> pce_t1
+
+```
+
+## Better Table 1
+
+```{r}
+wtd_median_iqr <- function(var, wt, rounding = 0) {
+  paste0(round(wtd.quantile(var, weights = wt, na.rm = T)[3], rounding) %>% format(nsmall = rounding),
+         " (", round(wtd.quantile(var, weights = wt, na.rm = T)[2], rounding) %>% format(nsmall = rounding),
+         " to ",
+         round(wtd.quantile(var, weights = wt, na.rm = T)[4], rounding) %>% format(nsmall = rounding),
+         ")")
+}
+library(Hmisc)
+list(c("Age (years)", sdata$variables[, wtd_median_iqr(age, weight)]),
+     c("Proportion of women (%)", sdata$variables[, sum(weight[sex == "female"]/sum(weight))] %>% {r1(.*100)}),
+     c("Race/Ethnicity (%)", ""),
+     c("   Non-Hispanic White", sdata$variables[, sum(weight[race == "Non-Hispanic White"]/sum(weight))] %>% {r1(.*100)}),
+     c("   Non-Hispanic Black", sdata$variables[, sum(weight[race == "Non-Hispanic Black"]/sum(weight))] %>% {r1(.*100)}),
+     c("   Hispanic", sdata$variables[, sum(weight[race == "Hispanic"]/sum(weight))] %>% {r1(.*100)}),
+     c("   Non-Hispanic Asian", sdata$variables[, sum(weight[race == "Hispanic"]/sum(weight))] %>% {r1(.*100)}),
+     c("   Other (including multiracial)", sdata$variables[, sum(weight[race == "Other (including multiracial)"]/sum(weight))] %>% {r1(.*100)}),
+     c("Body mass index (kg/m2)", sdata$variables[!is.na(bmi), wtd_median_iqr(bmi, weight, 1)]),
+     c("Systolic Blood pressure (mmHg)", sdata$variables[!is.na(sbp), wtd_median_iqr(sbp, weight, 0)]),
+     c("Diastolic Blood pressure (mmHg)", sdata$variables[!is.na(dbp), wtd_median_iqr(dbp, weight, 0)]),
+     c("HbA1c (%)", sdata$variables[!is.na(hba1c), wtd_median_iqr(hba1c, weight, 1)]),
+     c("Low-density lipoprotein cholesterol (mg/dL)", sdata$variables[!is.na(ldl), wtd_median_iqr(ldl, weight, 0)]),
+     c("Total cholesterol (mg/dL)", sdata$variables[!is.na(tc), wtd_median_iqr(tc, weight, 0)]),
+     c("High-density lipoprotein cholesterol (mg/dL)", sdata$variables[!is.na(hdl), wtd_median_iqr(hdl, weight, 0)]),
+     c("Non-High-density lipoprotein cholesterol (mg/dL)", sdata$variables[!is.na(hdl) & !is.na(tc), wtd_median_iqr(tc - hdl, weight, 0)]),
+     c("Triglycerides (mg/dL)", sdata$variables[!is.na(ldl), wtd_median_iqr(tg, weight, 0)]),
+     c("Obesity (%)", sdata$variables[!is.na(bmi), sum(weight[bmi >= 30]/sum(weight))] %>% {r1(.*100)}),
+     c("Diabetes (%)", sdata$variables[!is.na(dm), sum(weight[dm == "yes"]/sum(weight))] %>% {r1(.*100)}),
+     c("Hypertension (%)", sdata$variables[!is.na(htn), sum(weight[htn == "yes"]/sum(weight))] %>% {r1(.*100)}),
+     c("Aspirin use (%)", sdata$variables[!is.na(aspirin), sum(weight[aspirin == "yes"]/sum(weight))] %>% {r1(.*100)})
+) %>% 
+  {tibble(
+    `Variable` = lapply(., "[[", 1) %>% unlist,
+    `Value` = lapply(., "[[", 2) %>% unlist
+  )} -> baseline_table
+
+flextable(baseline_table) %>%
+  border_inner %>%
+  border_outer %>%
+  merge_h %>%
+  bold(i = 1, part = "header") %>%
+  bold(j = 1) %>%
+  set_caption(caption = as_paragraph(paste0("Table 1. Baseline characteristics of survey respondents aged 40-59 without a history of atherosclerotic cardiovascular disease or major bleeding risk factors (N = ", sdata$variables[, .N] %>% comma, ")"))) %>%
+  font(fontname = "Times New Roman") %>%
+  width(width = 3.5) %>%
+  save_as_docx(path = "Tables/Table 1.docx")
+
+```
+
+## Figure: Calibration
+
+```{r}
+
+#Create a directory for figures
+dir.create("Figures")
+
+#Build intercept-free slope-only model
+risk_model <- svyglm(design = sdata,
+                     prevent_10yr ~ 0 + pce_10yr
+                     )
+risk_model %>% summary -> risk_model_sum
+
+
+risk_seq <- seq(0, 1, 0.001)
+
+#Predict
+predict(risk_model,
+        newdata = data.frame(pce_10yr = risk_seq)
+        ) %>%
+  data.frame %>%
+  data.table -> risk_preds
+risk_preds[, prevent_10yr := link]
+risk_preds[, pce_10yr := risk_seq]
+
+#Get corresponidng PREVENT risk at a 10% PCE risk estimate
+prevent_at_10 <- predict(risk_model, newdata = data.frame(pce_10yr = 0.1))[1]
+
+
+#Plot
+ggplot(data = data,
+       aes(y = prevent_10yr,
+           x = pce_10yr,
+           )) +
+  #Add individual observations
+  geom_point(color = "lightblue4",
+             alpha  = 0.15,
+             show.legend = F,
+             aes(size = weight)
+             ) +
+    #Perfect calibration
+  geom_line(inherit.aes = F,
+            data = data.frame(pce_10yr = seq(0, 1, 0.01),
+                              prevent_10yr = seq(0, 1, 0.01)),
+            lwd = 1.5,
+            aes(x = pce_10yr,
+                y = prevent_10yr,
+                color = "Hypothetically equal risk estimates")
+              ) +
+  #Plot actual relation
+  geom_smooth(data = risk_preds,
+              lwd = 1.5, se = F, inherit.aes = F,
+              method = "loess",
+              aes(color = "Observed risk estimates",
+                  x = pce_10yr, y = prevent_10yr
+                  )
+              ) +
+  #Plot at 10%
+  geom_segment(x = 0.1, xend = 0.1, y = 0, yend = 0.1, lwd = 1.5) + 
+  geom_segment(y = 0.1, yend = 0.1, x = 0, xend = 0.1, lwd = 1.5, linetype = "dashed") + 
+  geom_segment(y = prevent_at_10, yend = prevent_at_10, x = 0, xend = 0.1, lwd = 1.5) + 
+  #Plot scales
+    scale_x_continuous(name = "10-year risk predicted by the Pooled Cohort Equation (%)",
+                     breaks = seq(0, 1, 0.05),
+                     expand = c(0, 0),
+                     labels = function(x) (x * 100) 
+                     ) +
+  scale_y_continuous(name = "10-year risk predicted by the PREVENT calculator (%)",
+                     breaks = seq(0, 1, 0.05),
+                     expand = c(0, 0),
+                     labels = function(x) (x * 100)
+                     ) +
+  scale_color_jama(name = NULL) +
+  scale_size_continuous(range = c(2.5, 15)) +
+  #Title
+  ggtitle("Relation between 10-year estimates of risk calculated by the pooled cohort equation and the PREVENT calculator",
+          subtitle = "The diagonal blue line represents hypothetically equal risk estimates between the PCE equation and the PREVENT calculator.\nThe area above it represents underestimated risk by the PCE, whereas the area below it represents overestimated risk by the PCE (relative to the PREVENT calculator).\nThe orange line represents the calibration slope based on an intercept-free linear regression model. Dot size is proportional to survey weight.\nThe solid black vertical line demarcate the 10% risk threshold recommended by the USPSTF for consideration of aspirin in adults aged 40-59 years.") +
+    theme_bw() +
+    theme(title = element_text(size = 16, face = "bold"),
+          plot.subtitle = element_text(face = "bold", size = 13, hjust = 0.0, color = "grey45"),
+        text = element_text(size = 14, face = "bold"),
+        axis.title.x = element_text(size = 18, face = "bold"),
+        axis.title.y = element_text(size = 18, face = "bold"),
+        axis.text.x = element_text(size = 15, face = "bold"),
+        axis.text.y = element_text(size = 15, face = "bold"),
+        legend.position = c(0.2, 0.9),
+        legend.text = element_text(size = 16),
+        legend.key.width = unit(3, units = "cm"),
+        legend.key.height = unit(1, units = "cm"),
+        legend.box.background = element_blank(),
+        legend.background = element_rect(fill = "transparent", 
+                                         color = "transparent")
+        ) +
+  coord_cartesian(
+    xlim = c(0, quantile(data$pce_10yr, na.rm = T, 0.95)),
+    ylim = c(0, quantile(data$pce_10yr, na.rm = T, 0.95))
+  ) -> risk_calib_plot
+
+#Predicted risks
+ggsave(risk_calib_plot,
+       filename = "Figures/Risk calibration.pdf",
+       dpi = 600,
+       width = 16, height = 9
+       )
+  
+```
+
+## Figure: Eligible by PREVENT vs PCE
+
+### Calculate eligibility by (BASE) PREVENT
+
+```{r}
+#Get total number of eligible patients (10%+) according to PREVENT
+list(
+  #Overall
+  " " = svytotal_df(design = sdata, 
+                    variables = ~ prevent_0.1) %>% mutate(group = "Overall"),
+  #Age-stratified
+  "40-49" = svytotal_df(design = subset(sdata, age >= 40 & age <= 49), 
+                        variables = ~ prevent_0.1) %>% mutate(group = "Age (years)"),
+  "50-59" = svytotal_df(design = subset(sdata, age >= 50 & age <= 59), 
+                        variables = ~ prevent_0.1) %>% mutate(group = "Age (years)"),
+  #Sex-stratified
+  "Female" = svytotal_df(design = subset(sdata, sex == "female"), 
+                         variables = ~ prevent_0.1) %>% mutate(group = "Sex"),
+  "Male" = svytotal_df(design = subset(sdata, sex == "male"), 
+                       variables = ~ prevent_0.1) %>% mutate(group = "Sex"),
+  #Race-stratified
+  "NH Black" = svytotal_df(design = subset(sdata,  race == "Non-Hispanic Black"), 
+                           variables = ~ prevent_0.1) %>% mutate(group = "Race/ethnicity"),
+  "NH White" = svytotal_df(design = subset(sdata,  race == "Non-Hispanic White"), 
+                           variables = ~ prevent_0.1) %>% mutate(group = "Race/ethnicity"),
+  "NH Asian" = svytotal_df(design = subset(sdata, race == "Non-Hispanic Asian"), 
+                           variables = ~ prevent_0.1) %>% mutate(group = "Race/ethnicity"),
+  "Hispanic" = svytotal_df(design = subset(sdata, race == "Hispanic"), 
+                           variables = ~ prevent_0.1) %>% mutate(group = "Race/ethnicity"),
+  "Hypertension" = svytotal_df(design = subset(sdata, htn == "yes"), 
+                               variables = ~ prevent_0.1) %>% mutate(group = "Comorbidities"),
+  "Obesity" = svytotal_df(design = subset(sdata, obesity == "yes"), 
+                          variables = ~ prevent_0.1) %>% mutate(group = "Comorbidities"),
+  "Diabetes" = svytotal_df(design = subset(sdata, dm == "yes"), 
+                           variables = ~ prevent_0.1) %>% mutate(group = "Comorbidities")
+) %>% 
+  #Bind together
+  {data.table(rbindlist(.) %>% select(-var),
+              stratum = names(.) %>% rep(each = 2))} -> prevent_eligible_data
+
+#Level factors accordingly
+prevent_eligible_data[, stratum := factor(stratum, levels = prevent_eligible_data$stratum %>% unique)]
+prevent_eligible_data[, group := factor(group, levels = prevent_eligible_data$group %>% unique)]
+
+#Calculate proportions/CIs
+prevent_eligible_data[, prop_pe_ci := pe_ci(100*prop_pe, 100*prop_lci, 100*prop_uci, rounding = 1)]
+prevent_eligible_data[, pe_ci := pe_ci(pe/10^6, lci/10^6, uci/10^6)]
+
+```
+
+### Calculate eligibility by FULL PREVENT
+
+```{r}
+#Get total number of eligible patients (10%+) according to PREVENT
+list(
+  #Overall
+  " " = svytotal_df(design = sdata, 
+                    variables = ~ prevent_full_0.1) %>% mutate(group = "Overall"),
+  #Age-stratified
+  "40-49" = svytotal_df(design = subset(sdata, age >= 40 & age <= 49), 
+                        variables = ~ prevent_full_0.1) %>% mutate(group = "Age (years)"),
+  "50-59" = svytotal_df(design = subset(sdata, age >= 50 & age <= 59), 
+                        variables = ~ prevent_full_0.1) %>% mutate(group = "Age (years)"),
+  #Sex-stratified
+  "Female" = svytotal_df(design = subset(sdata, sex == "female"), 
+                         variables = ~ prevent_full_0.1) %>% mutate(group = "Sex"),
+  "Male" = svytotal_df(design = subset(sdata, sex == "male"), 
+                       variables = ~ prevent_full_0.1) %>% mutate(group = "Sex"),
+  #Race-stratified
+  "NH Black" = svytotal_df(design = subset(sdata,  race == "Non-Hispanic Black"), 
+                           variables = ~ prevent_full_0.1) %>% mutate(group = "Race/ethnicity"),
+  "NH White" = svytotal_df(design = subset(sdata,  race == "Non-Hispanic White"), 
+                           variables = ~ prevent_full_0.1) %>% mutate(group = "Race/ethnicity"),
+  "NH Asian" = svytotal_df(design = subset(sdata, race == "Non-Hispanic Asian"), 
+                           variables = ~ prevent_full_0.1) %>% mutate(group = "Race/ethnicity"),
+  "Hispanic" = svytotal_df(design = subset(sdata, race == "Hispanic"), 
+                           variables = ~ prevent_full_0.1) %>% mutate(group = "Race/ethnicity"),
+  "Hypertension" = svytotal_df(design = subset(sdata, htn == "yes"), 
+                               variables = ~ prevent_full_0.1) %>% mutate(group = "Comorbidities"),
+  "Obesity" = svytotal_df(design = subset(sdata, obesity == "yes"), 
+                          variables = ~ prevent_full_0.1) %>% mutate(group = "Comorbidities"),
+  "Diabetes" = svytotal_df(design = subset(sdata, dm == "yes"), 
+                           variables = ~ prevent_full_0.1) %>% mutate(group = "Comorbidities")
+) %>% 
+  #Bind together
+  {data.table(rbindlist(.) %>% select(-var),
+              stratum = names(.) %>% rep(each = 2))} -> prevent_full_eligible_data
+
+#Level factors accordingly
+prevent_full_eligible_data[, stratum := factor(stratum, levels = prevent_full_eligible_data$stratum %>% unique)]
+prevent_full_eligible_data[, group := factor(group, levels = prevent_full_eligible_data$group %>% unique)]
+
+#Calculate proportions/CIs
+prevent_full_eligible_data[, prop_pe_ci := pe_ci(100*prop_pe, 100*prop_lci, 100*prop_uci, rounding = 1)]
+prevent_full_eligible_data[, pe_ci := pe_ci(pe/10^6, lci/10^6, uci/10^6)]
+
+```
+
+### Calculate eligibility by PCE
+
+```{r}
+
+#Get total number/proportion of eligible patients (10%+) according to PCE but not PREVENT
+list(
+  #Overall
+  " " = svytotal_df(design = sdata, 
+                    variables = ~ pce_0.1) %>% mutate(group = "Overall"),
+  #Age-stratified
+  "40-49" = svytotal_df(design = subset(sdata, age >= 40 & age <= 49), 
+                        variables = ~ pce_0.1) %>% mutate(group = "Age (years)"),
+  "50-59" = svytotal_df(design = subset(sdata, age >= 50 & age <= 59), 
+                        variables = ~ pce_0.1) %>% mutate(group = "Age (years)"),
+  #Sex-stratified
+  "Female" = svytotal_df(design = subset(sdata, sex == "female"), 
+                         variables = ~ pce_0.1) %>% mutate(group = "Sex"),
+  "Male" = svytotal_df(design = subset(sdata, sex == "male"), 
+                       variables = ~ pce_0.1) %>% mutate(group = "Sex"),
+  #Race-stratified
+  "NH Black" = svytotal_df(design = subset(sdata, race == "Non-Hispanic Black"), 
+                           variables = ~ pce_0.1) %>% mutate(group = "Race/ethnicity"),
+  "NH White" = svytotal_df(design = subset(sdata,  race == "Non-Hispanic White"), 
+                           variables = ~ pce_0.1) %>% mutate(group = "Race/ethnicity"),
+  "NH Asian" = svytotal_df(design = subset(sdata,   race == "Non-Hispanic Asian"), 
+                           variables = ~ pce_0.1) %>% mutate(group = "Race/ethnicity"),
+  "Hispanic" = svytotal_df(design = subset(sdata,  race == "Hispanic"), 
+                           variables = ~ pce_0.1) %>% mutate(group = "Race/ethnicity"),
+  "Hypertension" = svytotal_df(design = subset(sdata,  htn == "yes"), 
+                               variables = ~ pce_0.1) %>% mutate(group = "Comorbidities"),
+  "Obesity" = svytotal_df(design = subset(sdata, obesity == "yes"), 
+                          variables = ~ pce_0.1) %>% mutate(group = "Comorbidities"),
+  "Diabetes" = svytotal_df(design = subset(sdata,  dm == "yes"), 
+                           variables = ~ pce_0.1) %>% mutate(group = "Comorbidities")
+) %>% 
+  #Bind together
+  {data.table(rbindlist(.) %>% select(-var),
+              stratum = names(.) %>% rep(each = 2))} -> pce_eligible_data
+
+#Level factors accordingly
+pce_eligible_data[, stratum := factor(stratum, levels = pce_eligible_data$stratum %>% unique)]
+pce_eligible_data[, group := factor(group, levels = pce_eligible_data$group %>% unique)]
+
+#Calculate proportions/CIs
+pce_eligible_data[, prop_pe_ci := pe_ci(100*prop_pe, 100*prop_lci, 100*prop_uci, rounding = 1)]
+pce_eligible_data[, pe_ci := pe_ci(pe/10^6, lci/10^6, uci/10^6)]
+
+```
+
+### Plot (BASE PREVENT)
+
+```{r}
+
+#Combine
+rbind(
+  prevent_eligible_data %>% mutate(calculator = "PREVENT"),
+  pce_eligible_data %>% mutate(calculator = "PCE")) -> eligible_users_data
+
+#Plot
+ggplot(data = eligible_users_data %>% filter(value == "yes"),
+       aes(y = prop_pe,
+           ymin = prop_lci,
+           ymax = prop_uci,
+           x = interaction(stratum, group),
+           fill = calculator,
+           group = calculator
+           )) +
+  geom_col(position = position_dodge(width = 0.9)) +
+  geom_errorbar(width = 0.5, lwd = 1,
+                position = position_dodge(width = 0.9)) +
+  #Plot scales
+    scale_x_discrete(name = NULL,
+                     guide = "axis_nested",
+                     ) +
+  scale_y_continuous(name = "Eligible proportion (%)",
+                     breaks = seq(0, 1, 0.02),
+                     expand = c(0, 0),
+                     labels = function(x) (x * 100) 
+                     ) +
+  scale_fill_jama(name = "Risk calculator") +
+  #Title
+  ggtitle("Proportion of US adults without ASCVD aged 40-59 years potentially eligible for primary prevention aspirin by PCE vs PREVENT",
+          subtitle = "Bars represent estimated proportions and error bars represent 95% confidence intervals.\nEligibility is determined by a 10-year ASCVD risk estimate >10% in this cohort of patients aged 40-59 years without major bleeding risk factors.") +
+    theme_bw() +
+    theme(title = element_text(size = 14, face = "bold"),
+          plot.subtitle = element_text(face = "bold", size = 13, hjust = 0.0, color = "grey45"),
+        text = element_text(size = 14, face = "bold"),
+        axis.title.x = element_text(size = 18, face = "bold"),
+        axis.title.y = element_text(size = 18, face = "bold"),
+        axis.text = element_text(size = 16, face = "bold"),
+        legend.position = c(0.1, 0.9),
+        legend.key = element_rect(fill = "transparent"),
+        legend.background = element_rect(fill = "transparent"),
+        legend.text = element_text(size = 17, face = "bold"),
+        legend.title = element_text(size = 17, face = "bold"),
+        legend.key.width = unit(2, "cm"),
+        ggh4x.axis.nestline = element_line(linewidth = c(0, 1 %>% rep(4))),
+        ggh4x.axis.nesttext.x = element_text(vjust = 1.25)
+        ) +
+  coord_cartesian(
+    ylim = c(0, 0.4)
+  ) -> eligible_prop_plot
+
+#Predicted risks
+ggsave(eligible_prop_plot,
+       filename = "Figures/PREVENT vs PCE eligible.pdf",
+       dpi = 600,
+       width = 16, height = 9
+       )
+```
+
+### Plot (FULL PREVENT)
+
+```{r}
+
+#Combine
+rbind(
+  prevent_full_eligible_data %>% mutate(calculator = "PREVENT (Expanded to include UACR and HbA1c)"),
+  pce_eligible_data %>% mutate(calculator = "PCE")) -> eligible_users_data_full
+
+#Plot
+ggplot(data = eligible_users_data_full %>% filter(value == "yes"),
+       aes(y = prop_pe,
+           ymin = prop_lci,
+           ymax = prop_uci,
+           x = interaction(stratum, group),
+           fill = calculator,
+           group = calculator
+           )) +
+  geom_col(position = position_dodge(width = 0.9)) +
+  geom_errorbar(width = 0.5, lwd = 1,
+                position = position_dodge(width = 0.9)) +
+  #Plot scales
+    scale_x_discrete(name = NULL,
+                     guide = "axis_nested",
+                     ) +
+  scale_y_continuous(name = "Eligible proportion (%)",
+                     breaks = seq(0, 1, 0.02),
+                     expand = c(0, 0),
+                     labels = function(x) (x * 100) 
+                     ) +
+  scale_fill_jama(name = "Risk calculator") +
+  #Title
+  ggtitle("Proportion of US adults without ASCVD aged 40-59 years potentially eligible for primary prevention aspirin by PCE vs PREVENT (including UACR and HbA1c)",
+          subtitle = "Bars represent estimated proportions and error bars represent 95% confidence intervals.\nEligibility is determined by a 10-year ASCVD risk estimate of 10% in this cohort of patients aged 40-59 years without increased risk of bleeding.") +
+    theme_bw() +
+    theme(title = element_text(size = 12, face = "bold"),
+          plot.subtitle = element_text(face = "bold", size = 13, hjust = 0.0, color = "grey45"),
+        text = element_text(size = 14, face = "bold"),
+        axis.title.x = element_text(size = 18, face = "bold"),
+        axis.title.y = element_text(size = 18, face = "bold"),
+        axis.text = element_text(size = 16, face = "bold"),
+        legend.position = c(0.25, 0.9),
+        legend.key = element_rect(fill = "transparent"),
+        legend.background = element_rect(fill = "transparent"),
+        legend.text = element_text(size = 17, face = "bold"),
+        legend.title = element_text(size = 17, face = "bold"),
+        legend.key.width = unit(2, "cm"),
+        ggh4x.axis.nestline = element_line(linewidth = c(0, 1 %>% rep(4))),
+        ggh4x.axis.nesttext.x = element_text(vjust = 1.25)
+        ) +
+  coord_cartesian(
+    ylim = c(0, 0.4)
+  ) -> eligible_prop_plot_full
+
+#Predicted risks
+ggsave(eligible_prop_plot_full,
+       filename = "Figures/PREVENT vs PCE eligible [Full PREVENT].pdf",
+       dpi = 600,
+       width = 16, height = 9
+       )
+```
+
+## Figure: No longer eligible by PREVENT
+
+### Calculate
+
+```{r}
+#Get total number/proportion of eligible patients (10%+) according to PCE but not PREVENT
+list(
+  #Overall
+  " " = svytotal_df(design = subset(sdata, pce_0.1 == "yes"), 
+                    variables = ~ prevent_0.1) %>% mutate(group = "Overall"),
+  #Age-stratified
+  "40-49" = svytotal_df(design = subset(sdata, pce_0.1 == "yes" & age >= 40 & age <= 49), 
+                        variables = ~ prevent_0.1) %>% mutate(group = "Age (years)"),
+  "50-59" = svytotal_df(design = subset(sdata, pce_0.1 == "yes" & age >= 50 & age <= 59), 
+                        variables = ~ prevent_0.1) %>% mutate(group = "Age (years)"),
+  #Sex-stratified
+  "Female" = svytotal_df(design = subset(sdata, pce_0.1 == "yes" & sex == "female"), 
+                         variables = ~ prevent_0.1) %>% mutate(group = "Sex"),
+  "Male" = svytotal_df(design = subset(sdata, pce_0.1 == "yes" & sex == "male"), 
+                       variables = ~ prevent_0.1) %>% mutate(group = "Sex"),
+  #Race-stratified
+  "NH Black" = svytotal_df(design = subset(sdata, pce_0.1 == "yes" & race == "Non-Hispanic Black"), 
+                           variables = ~ prevent_0.1) %>% mutate(group = "Race/ethnicity"),
+  "NH White" = svytotal_df(design = subset(sdata, pce_0.1 == "yes" & race == "Non-Hispanic White"), 
+                           variables = ~ prevent_0.1) %>% mutate(group = "Race/ethnicity"),
+  "NH Asian" = svytotal_df(design = subset(sdata, pce_0.1 == "yes" & race == "Non-Hispanic Asian"), 
+                           variables = ~ prevent_0.1) %>% mutate(group = "Race/ethnicity"),
+  "Hispanic" = svytotal_df(design = subset(sdata, pce_0.1 == "yes" & race == "Hispanic"), 
+                           variables = ~ prevent_0.1) %>% mutate(group = "Race/ethnicity"),
+  "Hypertension" = svytotal_df(design = subset(sdata, pce_0.1 == "yes" & htn == "yes"), 
+                               variables = ~ prevent_0.1) %>% mutate(group = "Comorbidities"),
+  "Obesity" = svytotal_df(design = subset(sdata, pce_0.1 == "yes" & obesity == "yes"), 
+                          variables = ~ prevent_0.1) %>% mutate(group = "Comorbidities"),
+  "Diabetes" = svytotal_df(design = subset(sdata, pce_0.1 == "yes" & dm == "yes"), 
+                           variables = ~ prevent_0.1) %>% mutate(group = "Comorbidities")
+) %>% 
+  #Bind together
+  {data.table(rbindlist(.) %>% select(-var),
+              stratum = names(.) %>% rep(each = 2))} -> diff_eligible_data
+
+#Level factors accordingly
+diff_eligible_data[, stratum := factor(stratum, 
+                                      levels = diff_eligible_data$stratum %>% unique)]
+diff_eligible_data[, group := factor(group, levels = diff_eligible_data$group %>% unique)]
+
+#Calculate proportions/CIs
+diff_eligible_data[, prop_pe_ci := pe_ci(100*prop_pe, 100*prop_lci, 100*prop_uci, rounding = 1) %>% str_squish]
+diff_eligible_data[, pe_ci := pe_ci(pe/10^6, lci/10^6, uci/10^6)]
+
+#Formal test by sex
+svyglm(design = subset(sdata, pce_0.1 == "yes"), family= binomial, formula = factor(prevent_0.1) ~ sex) -> sex_diff
+
+#No DM Prop
+svytotal_df(design = subset(sdata, pce_0.1 == "yes" & dm == "no"), 
+                           variables = ~ prevent_0.1) %>% mutate(group = "Comorbidities") -> no_dm_prop
+svyglm(design = subset(sdata, pce_0.1 == "yes"), family= binomial, formula = factor(prevent_0.1) ~ dm) -> dm_diff
+
+
+```
+
+### Plot
+
+```{r}
+library(ggh4x)
+#Plot
+ggplot(data = diff_eligible_data[value == "no"],
+       aes(y = prop_pe,
+           ymin = prop_lci,
+           ymax = prop_uci,
+           x = interaction(stratum, group),
+           fill = group,
+           group = group
+       )) +
+  #Add individual observations
+  geom_col(width = 0.5, col = "black", lwd = 0.8,
+           position = position_dodge2(width = 0.1)
+  ) +
+  geom_errorbar(width = 0.25, lwd = 1) +
+  #Plot scales
+  scale_x_discrete(name = NULL,
+                   guide = "axis_nested",
+  ) +
+  scale_y_continuous(name = "Proportion no longer eligible by PREVENT (%)",
+                     breaks = seq(0, 1, 0.1),
+                     expand = c(0, 0),
+                     labels = function(x) (x * 100) 
+  ) +
+  scale_fill_jama(name = NULL) +
+  #Title
+  ggtitle("Proportion of US adults aged 40-59 years without ASCVD potentially eligible for primary prevention aspirin by the PCE but not by PREVENT",
+          subtitle = "Bars represent estimated proportions and error bars represent 95% confidence intervals.") +
+  theme_bw() +
+  theme(title = element_text(size = 13, face = "bold"),
+        plot.subtitle = element_text(face = "bold", size = 13, hjust = 0.0, color = "grey45"),
+        text = element_text(size = 14, face = "bold"),
+        axis.title.x = element_text(size = 18, face = "bold"),
+        axis.title.y = element_text(size = 18, face = "bold"),
+        axis.text = element_text(size = 16, face = "bold"),
+        legend.position = "none",
+        ggh4x.axis.nestline = element_line(linewidth = c(0, 1 %>% rep(4))),
+        ggh4x.axis.nesttext.x = element_text(vjust = 1.25)
+  ) +
+  coord_cartesian(
+    ylim = c(0, 1)
+  ) -> non_eligible_prop_plot
+
+#Predicted risks
+ggsave(non_eligible_prop_plot,
+       filename = "Figures/Prop no longer eligible.pdf",
+       dpi = 600,
+       width = 16, height = 9
+)
+```
+
+## Figure: Estimated risk reductions
+
+###Overall
+
+#### Data
+
+```{r}
+
+#Get N of rows with available data
+n_rows <- data[hbr == "no" & eval(inclusion) & !is.na(pce_10yr_aspirin_diff) & !is.na(prevent_10yr_aspirin_diff) , .N]
+
+#Get estimated risk reductions
+risk_reduction_fig_df <- data[hbr == "no" & eval(inclusion) & !is.na(pce_10yr_aspirin_diff) & !is.na(prevent_10yr_aspirin_diff), 
+                              .(arr = c(prevent_10yr_aspirin_diff, pce_10yr_aspirin_diff),
+                                weights = c(weight, weight),
+                               calculator = c("PREVENT" %>% rep(n_rows), "PCE" %>% rep(n_rows))
+                               )
+                              ] 
+
+#Get proportions with given levels of risk reduction
+below_1 <- risk_reduction_fig_df[, .(prop = sum(weights[arr < 0.01])/sum(weights),
+                                       n = sum(weights[arr < 0.01])
+                                        ), by = calculator]
+btwn_1_2 <- risk_reduction_fig_df[, .(prop = sum(weights[arr >= 0.01 & arr < 0.02])/sum(weights),
+                                       n = sum(weights[arr >= 0.01 & arr <= 0.02])
+                                        ), by = calculator]
+above_2 <- risk_reduction_fig_df[, .(prop = sum(weights[arr > 0.02])/sum(weights),
+                                       n = sum(weights[arr > 0.02])
+                                        ), by = calculator]
+
+```
+
+#### Plot
+
+```{r}
+
+ylabel_pos <- 2500000
+
+#Plot
+ggplot(data = risk_reduction_fig_df,
+       aes(x = arr,
+           y = after_stat(count),
+           fill = calculator,
+           color = calculator,
+           weights = weights
+       )) +
+  #Histograms
+  geom_histogram(data = risk_reduction_fig_df[calculator == "PREVENT"],
+                 binwidth = 0.0001,
+                 color = "black",lwd = 0.1
+  ) +
+  geom_histogram(data = risk_reduction_fig_df[calculator == "PCE"],
+                 binwidth = 0.0001,
+                 aes(y = - after_stat(count)),
+                 color = "black",lwd = 0.1
+  ) +
+  #Vertical lines
+  geom_vline(xintercept = 0.01, lwd = 1.5, linetype = "dashed", color = "red3") +
+  geom_vline(xintercept = 0.02, lwd = 1.5, linetype = "dashed", color = "red3") +
+  geom_hline(yintercept = 0, lwd = 1.1) +
+  #Labels below 0.5%
+  annotate(
+    x = 0.0065,
+    y = ylabel_pos*0.95,
+  geom = "text",
+  label = below_1[calculator == "PREVENT", r1(prop * 100) %>% paste0(., "% (",  round(n/1000000, 1), " million)", "\nwith ARR <1%")],
+  color = "black",
+  fontface = "bold",
+  size = 8
+  ) +
+  annotate(
+    x = 0.0065,
+    y = -{{ylabel_pos}}*0.95,
+    geom = "text",
+  label = below_1[calculator == "PCE", r1(prop * 100) %>% paste0(., "% (",  round(n/1000000, 1), " million)", "\nwith ARR <1%")],
+  color = "black",
+  fontface = "bold",
+  size = 8
+  ) +
+  #Labels between 1 to 2%
+  annotate(
+    x = 0.0145,
+    y = {{ylabel_pos}}*0.95,
+  geom = "text",
+  label = btwn_1_2[calculator == "PREVENT", r1(prop * 100) %>% paste0(., "% (",  round(n/1000000, 2), " million)", "\nwith ARR of 1 to 2%")],
+  color = "black",
+  fontface = "bold",
+  size = 8
+  ) +
+  annotate(
+    x = 0.0145,
+    y = -{{ylabel_pos}}*0.95,
+    geom = "text",
+  label = btwn_1_2[calculator == "PCE", r1(prop * 100) %>% paste0(., "% (",  round(n/1000000, 1), " million)", "\nwith ARR of 1 to 2%")],
+  color = "black",
+  fontface = "bold",
+  size = 8
+  ) +
+  #Labels >2%
+  annotate(
+    x = 0.0235,
+    y = {{ylabel_pos}}*0.95,
+     geom = "text",
+  label = above_2[calculator == "PREVENT", r1(prop * 100) %>% paste0(., "% (",  round(n/1000000, 1), ")", "\nwith ARR >2%")],
+  color = "black",
+  fontface = "bold",
+  size = 8
+  ) +
+  annotate(
+    x = 0.0235,
+    y = -{{ylabel_pos}}*0.95,
+     geom = "text",
+  label = above_2[calculator == "PCE", r1(prop * 100) %>% paste0(., "% (",  round(n/1000000, 2), " million)", "\nwith ARR >2%")],
+  color = "black",
+  fontface = "bold",
+  size = 8
+  ) +
+  #Scales
+  scale_fill_jama(name = NULL,
+                  breaks = c("PREVENT", "PCE")) +
+  scale_y_continuous(name = "Number of US Adults with estimated risk reduction, N",
+                     breaks = seq(-10000000, 10000000, 250000) %>% Filter(., f = function(x) x != 0),
+                     expand = c(0, 0),
+                     labels = function(x) abs(x) %>% comma) +
+  scale_x_continuous(name = "Estimated 10-year absolute risk reduction (%)",
+                     breaks = seq(0, 1, 0.001),
+                     expand = c(0.01, 0),
+                     labels = function(x) r1(abs(x)*100)) +
+  ggtitle("Implications of the Pooled Cohort Equations and PREVENT on estimated 10-year ASCVD risk reductions with Aspirin",
+          subtitle = "Estimates of ASCVD risk reduction were obtained by applying relative risk reductions obtained from a meta-analysis commissioned by the USPSTF to estimated 10-year risks.\nThe dashed lines correspond to absolute risk reductions of 1%, and 2%, corresponding to NNTs of 100 and 50 respectively.\nHistogram bars represent the number of US adults with a given level of risk reduction. Percentages are the proportion of US adults within a given category of risk reduction.") +
+  theme_bw() +
+  guides(fill = guide_legend(byrow = TRUE)) +
+  theme(text = element_text(size = 23),
+        plot.title=element_text(face = "bold",hjust = 0.0, size = 16),
+        plot.subtitle = element_text(face = "bold", size = 12, hjust = 0.0, color = "grey45"),
+        axis.text.x = element_text(size = 18, face = "bold"),
+        axis.text.y = element_text(size = 16, face = "bold"),
+        axis.title.x = element_text(size = 20, face = "bold"),
+        axis.title.y = element_text(size = 20, face = "bold"),
+        axis.line = element_line(colour = "black", linewidth = 1.2),
+        plot.margin = margin(0.5, 1, 0.5, 1, "cm"),
+        legend.position = c(0.9, 0.6),
+        legend.key.width = unit(2, "cm"),
+        legend.spacing.y = unit(8, 'lines'),
+        legend.title = element_text(face = "bold"),
+        legend.text = element_text(face = "bold"),
+        legend.background = element_rect(fill = "transparent")
+        ) +
+  coord_cartesian(xlim = c(0, NA),
+                  ylim = c(-1, 1) * (ylabel_pos*1.1)) -> arr_hist_fig
+
+#Predicted risks
+ggsave(arr_hist_fig,
+       filename = "Figures/Anticipated ARR [Overall].pdf",
+       dpi = 600,
+       width = 16, height = 9
+)
+
+```
+
+###PCE \>10%
+
+#### Data
+
+```{r}
+
+#Get N of rows with available data
+n_rows <- data[pce_0.1 == "yes" & hbr == "no" & eval(inclusion) & !is.na(pce_10yr_aspirin_diff) & !is.na(prevent_10yr_aspirin_diff) , .N]
+
+#Get estimated risk reductions
+risk_reduction_fig_df_pce0.1 <- data[pce_0.1 == "yes" & hbr == "no" & eval(inclusion) & !is.na(pce_10yr_aspirin_diff) & !is.na(prevent_10yr_aspirin_diff), 
+                              .(arr = c(prevent_10yr_aspirin_diff, pce_10yr_aspirin_diff),
+                                weights = c(weight, weight),
+                               calculator = c("PREVENT" %>% rep(n_rows), "PCE" %>% rep(n_rows))
+                               )
+                              ] 
+
+#Get proportions with given levels of risk reduction
+below_1_pce0.1 <- risk_reduction_fig_df_pce0.1[, .(prop = sum(weights[arr < 0.01])/sum(weights),
+                                       n = sum(weights[arr < 0.01])
+                                        ), by = calculator]
+btwn_1_2_pce0.1 <- risk_reduction_fig_df_pce0.1[, .(prop = sum(weights[arr >= 0.01 & arr < 0.02])/sum(weights),
+                                       n = sum(weights[arr >= 0.01 & arr <= 0.02])
+                                        ), by = calculator]
+above_2_pce0.1 <- risk_reduction_fig_df_pce0.1[, .(prop = sum(weights[arr > 0.02])/sum(weights),
+                                       n = sum(weights[arr > 0.02])
+                                        ), by = calculator]
+
+
+```
+
+####Plot
+
+```{r}
+
+ylabel_pos <- 250000
+
+#Plot
+ggplot(data = risk_reduction_fig_df_pce0.1,
+       aes(x = arr,
+           y = after_stat(count),
+           fill = calculator,
+           color = calculator,
+           weights = weights
+       )) +
+  #Histograms
+  geom_histogram(data = risk_reduction_fig_df_pce0.1[calculator == "PREVENT"],
+                 binwidth = 0.0001,
+                 color = "black",lwd = 0.1
+  ) +
+  geom_histogram(data = risk_reduction_fig_df_pce0.1[calculator == "PCE"],
+                 binwidth = 0.0001,
+                 aes(y = - after_stat(count)),
+                 color = "black",lwd = 0.1
+  ) +
+  #Vertical lines
+  geom_vline(xintercept = 0.01, lwd = 1.5, linetype = "dashed", color = "red3") +
+  geom_vline(xintercept = 0.02, lwd = 1.5, linetype = "dashed", color = "red3") +
+  geom_hline(yintercept = 0, lwd = 1.1) +
+  #Labels below 0.5%
+  annotate(
+    x = 0.003,
+    y = ylabel_pos*0.95,
+    geom = "text",
+    label = below_1_pce0.1[calculator == "PREVENT", r1(prop * 100) %>% paste0(., "% (",  round(n/1000000, 1), " million)", "\nwith ARR <1%")],
+    color = "black",
+    fontface = "bold",
+    size = 8
+  ) +
+  annotate(
+    x = 0.003,
+    y = -{{ylabel_pos}}*0.95,
+    geom = "text",
+    label = below_1_pce0.1[calculator == "PCE", r1(prop * 100) %>% paste0(., "% (",  round(n/1000000, 1), " million)", "\nwith ARR <1%")],
+    color = "black",
+    fontface = "bold",
+    size = 8
+  ) +
+  #Labels between 1 to 2%
+  annotate(
+    x = 0.0145,
+    y = {{ylabel_pos}}*0.95,
+    geom = "text",
+    label = btwn_1_2_pce0.1[calculator == "PREVENT", r1(prop * 100) %>% paste0(., "% (",  round(n/1000000, 1), " million)", "\nwith ARR of 1 to 2%")],
+    color = "black",
+    fontface = "bold",
+    size = 8
+  ) +
+  annotate(
+    x = 0.0145,
+    y = -{{ylabel_pos}}*0.95,
+    geom = "text",
+    label = btwn_1_2_pce0.1[calculator == "PCE", r1(prop * 100) %>% paste0(., "% (",  round(n/1000000, 1), " million)", "\nwith ARR of 1 to 2%")],
+    color = "black",
+    fontface = "bold",
+    size = 8
+  ) +
+  #Labels >2%
+  annotate(
+    x = 0.0235,
+    y = {{ylabel_pos}}*0.95,
+    geom = "text",
+    label = above_2_pce0.1[calculator == "PREVENT", r1(prop * 100) %>% paste0(., "% (",  round(n/1000000, 1), ")", "\nwith ARR >2%")],
+    color = "black",
+    fontface = "bold",
+    size = 8
+  ) +
+  annotate(
+    x = 0.0235,
+    y = -{{ylabel_pos}}*0.95,
+    geom = "text",
+    label = above_2_pce0.1[calculator == "PCE", r1(prop * 100) %>% paste0(., "% (",  round(n/1000000, 2), " million)", "\nwith ARR >2%")],
+    color = "black",
+    fontface = "bold",
+    size = 8
+  ) +
+  #Scales
+  scale_fill_jama(name = NULL,
+                  breaks = c("PREVENT", "PCE")) +
+  scale_y_continuous(name = "Number of US Adults with estimated risk reduction, N",
+                     breaks = seq(-10000000, 10000000, 50000) %>% Filter(., f = function(x) x != 0),
+                     expand = c(0, 0),
+                     labels = function(x) abs(x) %>% comma) +
+  scale_x_continuous(name = "Estimated 10-year absolute risk reduction (%)",
+                     breaks = seq(0, 1, 0.001),
+                     expand = c(0.01, 0),
+                     labels = function(x) r1(abs(x)*100)) +
+  ggtitle("Implications of the Pooled Cohort Equations and PREVENT on estimated 10-year ASCVD risk reductions with Aspirin, among PCE-eligible candidates",
+          subtitle = "Estimates of ASCVD risk reduction were obtained by applying relative risk reductions obtained from a meta-analysis commissioned by the USPSTF to estimated 10-year risks.\nThe dashed lines correspond to absolute risk reductions of 1%, and 2%, corresponding to NNTs of 100 and 50 respectively.\nHistogram bars represent the number of US adults with a given level of risk reduction. Percentages are the proportion of US adults within a given category of risk reduction.") +
+  theme_bw() +
+  guides(fill = guide_legend(byrow = TRUE)) +
+  theme(text = element_text(size = 23),
+        plot.title=element_text(face = "bold",hjust = 0.0, size = 14),
+        plot.subtitle = element_text(face = "bold", size = 12, hjust = 0.0, color = "grey45"),
+        axis.text.x = element_text(size = 18, face = "bold"),
+        axis.text.y = element_text(size = 16, face = "bold"),
+        axis.title.x = element_text(size = 20, face = "bold"),
+        axis.title.y = element_text(size = 20, face = "bold"),
+        axis.line = element_line(colour = "black", linewidth = 1.2),
+        plot.margin = margin(0.5, 1, 0.5, 1, "cm"),
+        legend.position = c(0.9, 0.6),
+        legend.key.width = unit(2, "cm"),
+        legend.spacing.y = unit(8, 'lines'),
+        legend.title = element_text(face = "bold"),
+        legend.text = element_text(face = "bold"),
+        legend.background = element_rect(fill = "transparent")
+  ) +
+  coord_cartesian(xlim = c(0, NA),
+                  ylim = c(-1, 1) * (ylabel_pos*1.1)) -> arr_hist_fig_pce0.1
+
+#Predicted risks
+ggsave(arr_hist_fig_pce0.1,
+       filename = "Figures/Anticipated ARR [PCE 10].pdf",
+       dpi = 600,
+       width = 16, height = 9
+)
+```
+
+## Figure: Estimated net benefit
+
+###PCE \>10%
+
+#### Data
+
+```{r}
+
+#Get N of rows with available data
+n_rows_nb <- data[hbr == "no" & eval(inclusion) & !is.na(pce_nb) & !is.na(prevent_nb) & pce_10yr > 0.1 , .N]
+
+#Get estiamted risk reductions
+net_benefit_fig_df <- data[hbr == "no" & eval(inclusion) & !is.na(pce_nb) &
+                             !is.na(prevent_nb) &
+                             pce_10yr > 0.1, 
+                              .(nb = c(prevent_nb, pce_nb),
+                                weights = c(weight, weight),
+                               calculator = c("PREVENT" %>%
+                                                rep(n_rows_nb), 
+                                              "PCE" %>% 
+                                                rep(n_rows_nb))
+                               )
+                              ] 
+
+#Get proportions with given levels of risk reduction
+below_0 <- net_benefit_fig_df[, .(prop = sum(weights[nb < 0])/sum(weights),
+                                       n = sum(weights[nb < 0])
+                                        ), by = calculator]
+
+above_0 <- net_benefit_fig_df[, .(prop = sum(weights[nb > 0])/sum(weights),
+                                       n = sum(weights[nb > 0])
+                                        ), by = calculator]
+```
+
+#### Plot
+
+```{r}
+
+ylabel_pos <- 320000
+label_size <- 7.5
+#Plot
+ggplot(data = net_benefit_fig_df,
+       aes(x = nb,
+           y = after_stat(count),
+           fill = calculator,
+           color = calculator,
+           weights = weights
+       )) +
+  #Histograms
+  geom_histogram(data = net_benefit_fig_df[calculator == "PREVENT"],
+                 binwidth = 0.0001,
+                 color = "black",lwd = 0.1
+  ) +
+  geom_histogram(data = net_benefit_fig_df[calculator == "PCE"],
+                 binwidth = 0.0001,
+                 aes(y = - after_stat(count)),
+                 color = "black",lwd = 0.1
+  ) +
+  #Vertical lines
+  geom_vline(xintercept = 0, lwd = 1.5, linetype = "dashed", color = "red3") +
+  geom_hline(yintercept = 0, lwd = 1.1) +
+  #Labels net harm
+  annotate(
+    x = -0.0033,
+    y = {{ylabel_pos}}*0.95,
+  label = below_0[calculator == "PREVENT", r1(prop * 100) %>% paste0(., "% (", round(n/1000000, 1), " million)\nwith net harm")],
+  color = "black",
+  geom = "text",
+  fontface = "bold",
+  size = label_size
+  ) +
+  annotate(
+    x = -0.0033,
+    y = -{{ylabel_pos}}*0.95,
+  label = below_0[calculator == "PCE", r1(prop * 100) %>% paste0(., "% (", round(n/1000000, 1), " million)\nwith net harm")],
+  color = "black",
+  geom = "text",
+  fontface = "bold",
+  size = label_size
+  ) +
+  #Label net benefit
+  annotate(
+    x = 0.0045,
+    y = {{ylabel_pos}}*0.95,
+  label = above_0[calculator == "PREVENT", r1(prop * 100) %>% paste0(., "% (", round(n/1000000, 1), " million)\nwith net benefit")],
+  color = "black",
+  geom = "text",
+  fontface = "bold",
+  size = label_size
+  ) +
+  annotate(
+    x = 0.0045,
+    y = -{{ylabel_pos}}*0.95,
+  label = above_0[calculator == "PCE", r1(prop * 100) %>% paste0(., "% (", round(n/1000000, 1), " million)\nwith net benefit")],
+  geom = "text",
+  color = "black",
+  fontface = "bold",
+  size = label_size
+  ) +
+  #Scales
+  scale_fill_jama(name = NULL,
+                  breaks = c("PREVENT", "PCE")) +
+  scale_y_continuous(name = "Number of US Adults with estimated net benefit or harm, N",
+                     breaks = seq(-10000000, 10000000, 50000) %>% Filter(., f = function(x) x != 0),
+                     expand = c(0, 0),
+                     labels = function(x) abs(x) %>% comma) +
+  scale_x_continuous(name = "Net benefit or harm over 10 years (%)",
+                     breaks = seq(-1, 1, 0.002),
+                     expand = c(0.01, 0),
+                     labels = function(x) r1((x)*100)) +
+  ggtitle("Implications of the PCE and PREVENT on estimated net benefit with Aspirin, among PCE-eligible candidates",
+          subtitle = "Net benefit was calculated as the difference between absolute risk decrease in ASCVD minus absolute risk increase in major GI and intracranial bleeding, over a 10-year time horizon.\nEstimated ASCVD risk reductions and bleeding increases were obtained by applying relative effect sizes from a USPSTF commissioned systematic review to individual risks.\nThe dashed vertical line at 0 demarcates net benefit vs harm. Bars to the left indicate net harm and bars to the right indicate net benefit.\nHistogram bars represent the number of US adults with a given level of net benefit or harm. PCE eligiblity for aspirin is defined as a 10-year risk of 10% or greater.") +
+  theme_bw() +
+  guides(fill = guide_legend(byrow = TRUE)) +
+  theme(text = element_text(size = 23),
+        plot.title=element_text(face = "bold",hjust = 0.0, size = 16),
+        plot.subtitle = element_text(face = "bold", size = 12, hjust = 0.0, color = "grey45"),
+        axis.text.x = element_text(size = 18, face = "bold"),
+        axis.text.y = element_text(size = 16, face = "bold"),
+        axis.title.x = element_text(size = 20, face = "bold"),
+        axis.title.y = element_text(size = 20, face = "bold"),
+        axis.line = element_line(colour = "black", linewidth = 1.2),
+        plot.margin = margin(0.5, 1, 0.5, 1, "cm"),
+        legend.position = c(0.9, 0.6),
+        legend.key.width = unit(2, "cm"),
+        legend.spacing.y = unit(8, 'lines'),
+        legend.title = element_text(face = "bold"),
+        legend.text = element_text(face = "bold"),
+        legend.background = element_rect(fill = "transparent")
+        ) +
+  coord_cartesian(xlim = c(NA, NA),
+                  ylim = c(-1, 1) * ylabel_pos*1.1) -> nb_hist_fig
+
+#Predicted risks
+ggsave(nb_hist_fig,
+       filename = "Figures/Anticipated Net Benefit.pdf",
+       dpi = 600,
+       width = 16, height = 9
+)
+  
+```
