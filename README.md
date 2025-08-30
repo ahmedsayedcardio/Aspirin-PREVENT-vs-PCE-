@@ -6,4 +6,6 @@ Please note that you will need to download NHANES files (2015-2020): https://www
 Afterwards, you need to place the downloaded files into their respective folder names in a directory of your choosing and direct R to access the files from this directory. Instructions for this are present in the
 "Import" heading of the Quarto file herein. 
 
+Also, please note that this code reflects the analysis at the *time of submission*, and may not incorporate all of the additions and subtractions present in the final (accepted) work.
+
 Should you have any questions related to this analysis, please do not hesitate to reach out via email (asu.ahmed.sayed@gmail.com)
